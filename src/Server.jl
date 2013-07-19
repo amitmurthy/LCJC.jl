@@ -27,20 +27,47 @@ function handle_client(s)
         while true
             println(getpid(), ": Waiting for a request")
             where = deserialize(s)
-            println(getpid(), ": Got a request")
-            
-            f = deserialize(s)
+            arg0 = deserialize(s)
             args = deserialize(s)
             if where == :master
-                retval = apply(f, args)
-            elseif where == :pmap
-                retval = pmap(f, args)
+                println(getpid(), ": Got a :master request")
+                f = arg0
+                result = apply(f, args)
+            elseif where == :workers
+                println(getpid(), ": Got a :workers request")
+                f = arg0
+                result = cell(nworkers())
+                @sync begin
+                    i = 1
+                    for pid in workers()
+                        @async begin
+                            result[i] = remotecall_fetch(pid, f, args...)
+                        end
+                        i += 1
+                    end
+                end
+            elseif where == :mapred
+                println(getpid(), ": Got a :mapred request")
+                (mapf, redf, acc, start, total) = arg0        
+            
+                outs = cell(nworkers())
+                @sync begin
+                    i = 1
+                    for pid in workers()
+                        @async begin
+                            outs[i] = remotecall_fetch(pid, mapf, start + i - 1, total)
+                        end
+                        i += 1
+                    end
+                end
+                
+                result = reduce(redf, acc, outs)
             end    
-            println(getpid(), ": Sending back $(retval)")
-            serialize(s, retval)
+            println(getpid(), ": Sending back $(result)")
+            serialize(s, result)
         end
-    catch
-        println(getpid(), ": Client disconnected")
+    catch e
+        println(getpid(), ": Error : ", e)
     end
     
     close(s)

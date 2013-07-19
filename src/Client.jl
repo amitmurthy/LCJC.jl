@@ -3,11 +3,11 @@ import Base.pmap
 
 
 exec_on_master(s, f, args...) = exec_request(s, :master, f, args...)
-exec_pmap(s, f, args...) = exec_request(s, :pmap, f, args...)
+exec_on_workers(s, f, args...) = exec_request(s, :workers, f, args...)
 
-function exec_request(s, mode, f, args...)
+function exec_request(s, mode, arg0, args...)
     serialize(s, mode)
-    serialize(s, f)
+    serialize(s, arg0)
     serialize(s, args)
     deserialize(s)
 end
@@ -31,13 +31,17 @@ type NodeHandle <: WorkerNode
 end 
 
 function show(io::IO, o::NodeHandle)
-    println(io, "hosts: ", o.hosts)
+    println(io, "hosts: ", o.host)
     println(io, "tunnelport: ", o.tunnelport)
     println(io, "pids: ", o.pids)
     if isdefined(o, :s)
-        println(io, "socket connected")
+        if isopen(o.s)
+            println(io, "socket connected")
+        else
+            println(io, "socket not connected")
+        end
     else
-        println(io, "socket not connected")
+        println(io, "no socket")
     end
 end
 
@@ -82,13 +86,22 @@ function start_cluster(node::WorkerNode)
     execmd(`scp $(h.sshflags) Server.jl $(h.ssh_user)@$(node.host):jrun/Server.jl`)
     execmd(`ssh -n $(h.sshflags) $(h.ssh_user)@$(node.host) "bash -l -c \"cd jrun; $(h.dir)/julia-release-basic Server.jl --port $(h.port) </dev/null >> server.log 2>&1 &\" "`)
 
+    # Compensate for Julia's startup delay.
+    sleep(1.0)
+    
     start = time()
     while (time() - start) < 15
         try
             println("Trying connect to $(node.host):$(h.port) via localhost:$(node.tunnelport)")
             s = connect("localhost", node.tunnelport)
+
+            println("@1")
+            resp = exec_on_master(s, x->x, "Hello") 
+            println("@2")
+            assert (resp == "Hello")
+            println("@3")
             node.s = s
-            println("Connected to $(node.host):$(h.port) via localhost:$(node.tunnelport)")
+            
             break;
         
         catch e
@@ -98,6 +111,8 @@ function start_cluster(node::WorkerNode)
     
     if !isdefined(node, :s)
         error("Unable to connect to node $(node.host):$(h.port)")
+    else
+        println("Connected to $(node.host):$(h.port) via localhost:$(node.tunnelport)")
     end
 
     node.pids = exec_on_master(node.s, ()->addworkers())
@@ -120,7 +135,7 @@ function start_cluster(hosts::AbstractArray; port::Int=9500, sshflags::Cmd=``, s
         for host in hosts
             @async begin
                 try
-                    tunnelport = ssh_tunnel(ssh_user, host, port, sshflags)
+                    tunnelport = ssh_tunnel(host, h)
                     nodeinst = NodeHandle(host, tunnelport, h)
                     start_cluster(nodeinst)
                     push!(h.nodes, nodeinst)
@@ -133,18 +148,25 @@ function start_cluster(hosts::AbstractArray; port::Int=9500, sshflags::Cmd=``, s
     h
 end
 
-tunnel_cmd(user, host, port, localp, sshflags) = `ssh -f -o ExitOnForwardFailure=yes $sshflags $(user)@$host -L $localp:$host:$(int(port)) sleep 60`
+tunnel_cmd(host, priv_ip, localp, h) = `ssh -f -o ExitOnForwardFailure=yes $(h.sshflags) $(h.ssh_user)@$host -L $localp:$(priv_ip):$(int(h.port)) sleep 60`
 
 wc_tunnelport = 8500
-function ssh_tunnel(user, host, port, sshflags)
+function ssh_tunnel(host, h::SetHandle)
+    ipcmd = `ssh $(h.ssh_user)@$host "$(h.dir)/julia-release-basic -e \"println(getipaddr())\""`
+    println(ipcmd)
+    io,_=readsfrom(ipcmd)    
+    io.line_buffered = true
+    priv_ip = strip(readline(io))
+    println("Private ip $(priv_ip) of host $host")
+
     global wc_tunnelport
     localp = wc_tunnelport::Int
-    c = tunnel_cmd(user, host, port, localp, sshflags)
+    c = tunnel_cmd(host, priv_ip, localp, h)
     c.detach=true
     while !success(c) && localp < 10000
         println("Trying on port $localp")
         localp += 1
-        c = tunnel_cmd(user, host, port, localp, sshflags)
+        c = tunnel_cmd(host, priv_ip, localp, h)
         c.detach=true
     end
     
@@ -158,11 +180,47 @@ function ssh_tunnel(user, host, port, sshflags)
     localp
 end
 
-function pmap (NodeSet, f, args...)
-# Assumes that each worker process has the same compute capabilty as any other.
+function mapred (ns::NodeSet, mapf::Function, redf::Function, acc::Any)
+    # Assumes that each worker process has the same compute capabilty as any other.
+    # Function mapf if of the form  mapf(pid, totalpids)
+    
+    totalp = reduce((acc, node) -> acc + length(node.pids), 0, ns.nodes)
+    println("Total number of worker across NodeSets : ", totalp)
+    
+    results = cell(length(ns.nodes))
+    
+    @sync begin
+        for i in 1:length(ns.nodes)
+            j = 1
+            @async begin
+                results[i] = exec_request(ns.nodes[i].s, :mapred, (mapf, redf, acc, j, totalp), ()) 
+            end
+            j += length(ns.nodes[i].pids)
+        end
+    end
 
-
+    #reduce the output
+    reduce(redf, acc, results)
 end
 
 
-#start_cluster(["localhost"])
+function stop_cluster (ns::NodeSet)
+    @sync begin
+        for n in ns.nodes
+            @async begin
+                try
+                    exec_on_master(n.s, exit) 
+                catch e
+                    close(n.s)
+                end
+            end
+        end
+    end
+end
+
+
+# ns = start_cluster(["localhost"])
+# ns = start_cluster(["julia.mit.edu"], dir="/home/amitm/julia/julia/usr/bin")
+# mapred(ns, (id, tot) -> tot*1000 + id, (acc, v) -> acc + v, 0)
+# stop_cluster(ns)
+
