@@ -180,11 +180,8 @@ function start_server(port)
 end
 
 
-idxarr = findin(ARGS, ["--port"])
-if length(idxarr) == 0
-    error("Must specify a port with a '--port' option to listen on")
+if haskey(ENV, "COD_PORT") 
+    port = int16(ENV["COD_PORT"])
+    start_server(port)
 end
 
-port = int16(ARGS[int(idxarr[1]) + 1])
-
-start_server(port)

@@ -6,7 +6,7 @@ export WorkerNode
 abstract NodeSet
 export NodeSet
 
-#export ns_start, ns_stop, ns_nworkers
+#export start, stop, nworkers
 
 type NodeHandle <: WorkerNode
     host::String
@@ -90,15 +90,16 @@ function execmd(c)
 end
 
 # starts the cluster on as many 
-function ns_start(n::WorkerNode)
+function start(n::WorkerNode)
     # first start the julia process
-    execmd(`ssh -n $(n.sshflags) $(n.ssh_user)@$(n.host) "mkdir -p jrun; cd jrun; "`)
+#    execmd(`ssh -n $(n.sshflags) $(n.ssh_user)@$(n.host) "mkdir -p jrun; cd jrun; "`)
     
-    sfile = "nodeserver.jl"
+#    sfile = "nodeserver.jl"
 #    sfilefull = Pkg.dir() * "/PTools/src/$(sfile)" 
-    sfilefull = "./$(sfile)" 
-    execmd(`scp $(n.sshflags) $(sfilefull) $(n.ssh_user)@$(n.host):jrun/$(sfile)`)
-    execmd(`ssh -n $(n.sshflags) $(n.ssh_user)@$(n.host) "bash -l -c \"cd jrun; $(n.dir)/julia-release-basic $(sfile) --port $(n.port) </dev/null >> server.log 2>&1 &\" "`)
+#    sfilefull = "./$(sfile)" 
+#    execmd(`scp $(n.sshflags) $(sfilefull) $(n.ssh_user)@$(n.host):jrun/$(sfile)`)
+#    execmd(`ssh -n $(n.sshflags) $(n.ssh_user)@$(n.host) "bash -l -c \"cd jrun; $(n.dir)/julia-release-basic $(sfile) --port $(n.port) </dev/null >> server.log 2>&1 &\" "`)
+    execmd(`ssh -n $(n.sshflags) $(n.ssh_user)@$(n.host) "bash -l -c \"mkdir -p jrun; cd jrun; export COD_PORT=$(n.port); $(n.dir)/julia-release-basic -e 'using(CoD)'  </dev/null >> server.log 2>&1 &\" "`)
 
     # Compensate for Julia's startup delay.
     sleep(2.0)
@@ -152,7 +153,7 @@ function get_st()
 end
 
 
-function ns_start(machines::AbstractArray; port::Int=9500, sshflags::Cmd=``, ssh_user::String=ENV["USER"], dir=JULIA_HOME)
+function start(machines::AbstractArray; port::Int=9500, sshflags::Cmd=``, ssh_user::String=ENV["USER"], dir=JULIA_HOME)
     h = SetHandle(machines)
     @sync begin
         for m in machines
@@ -169,7 +170,7 @@ function ns_start(machines::AbstractArray; port::Int=9500, sshflags::Cmd=``, ssh
             @async begin
                 try
                     ssh_tunnel!(n)
-                    ns_start(n)
+                    start(n)
                     push!(h.nodes, n)
                 catch e
                     println("Could not start workers on node $(n.host) : ", e, "\n", get_st())
@@ -213,26 +214,28 @@ function ssh_tunnel!(n::NodeHandle)
     localp
 end
 
-ns_map(ns::NodeSet, mapf::Function) = ns_mapr (ns, mapf)
+map(ns::NodeSet, mapf::Function) = mapr (ns, mapf)
 
-function ns_mapr (ns::NodeSet, mapf::Function; redf=nothing, acc=0, timeout=0.0, testpids=false)
+function mapr (ns::NodeSet, mapf::Function; redf=nothing, acc=0, timeout=0.0, testpids=false, async=false, rexec=false)
     # Assumes that each worker process has the same compute capabilty as any other.
     # Function mapf if of the form  mapf(pid, totalpids)
     
-    testpids && ns_refresh!(ns)
+    testpids && refresh!(ns)
     
-    totalp = ns_nworkers(ns) 
+    totalp = nworkers(ns) 
     println("Total number of worker across NodeSets : ", totalp)
     
     results = cell(length(ns.nodes))
+
+    jobid = string(Random.uuid4())
+    base_params = {:redf=>redf, :acc=>acc, :start=>j, :total=>totalp, :timeout=>timeout, :rexec=>rexec, :jobid=>jobid}
     
-    @sync begin
+    f_exec_map() = begin
         for i in 1:length(ns.nodes)
             j = 1
             @async begin
-                params = {:redf=>redf, :acc=>acc, :start=>j, :total=>totalp, :timeout=>timeout}
-                
                 if testpids 
+                    params = copy(base_params)
                     params[:pids] = ns.nodes[i].pids
                 end
                 
@@ -242,12 +245,26 @@ function ns_mapr (ns::NodeSet, mapf::Function; redf=nothing, acc=0, timeout=0.0,
         end
     end
 
+    if async && (redf != nothing) && !rexec
+        error("Invalid async mode - either redf must not be defined or rexec must be true")
+    end
+    
+    if rexec
+        # Currently will always execute on the first node.
+        
+    elseif async
+        f_exec_map()
+        return jobid
+    else
+        @sync f_exec_map()
+    end
+
     #reduce the output
     redf != nothing ? reduce(redf, acc, results) : results
 end
     
 
-function ns_stop (ns::NodeSet)
+function stop (ns::NodeSet)
     @sync begin
         for n in ns.nodes
             @async begin
@@ -263,9 +280,9 @@ function ns_stop (ns::NodeSet)
     end
 end
 
-ns_nworkers(ns::NodeSet) = reduce((acc, node) -> acc + length(node.pids), 0, ns.nodes)
+nworkers(ns::NodeSet) = reduce((acc, node) -> acc + length(node.pids), 0, ns.nodes)
 
-function ns_refresh!(ns::NodeSet)
+function refresh!(ns::NodeSet)
     @sync begin
         for n in ns.nodes
             @async begin
@@ -285,10 +302,10 @@ function ns_everywhere(ns, f)
 end
 
 # include("nodesets.jl")
-# ns = ns_start(["localhost"])
-# ns = ns_start(["julia.mit.edu"], dir="/home/amitm/julia/julia/usr/bin")
+# ns = start(["localhost"])
+# ns = start(["julia.mit.edu"], dir="/home/amitm/julia/julia/usr/bin")
 # mapred(ns, (id, tot) -> tot*1000 + id, (acc, v) -> acc + v, 0)
-# ns_stop(ns)
+# stop(ns)
 
-# ns = ns_start([{:host -=> "julia.mit.edu", dir=>"/home/amitm/julia/julia/usr/bin", :nworkers => 10}, "localhost"])
-# ns = ns_start([{:host -=> "localhost", :port => 9501}, "localhost", {:host -=> "localhost", :port => 9502}])
+# ns = start([{:host -=> "julia.mit.edu", dir=>"/home/amitm/julia/julia/usr/bin", :nworkers => 10}, "localhost"])
+# ns = start([{:host -=> "localhost", :port => 9501}, "localhost", {:host -=> "localhost", :port => 9502}])
